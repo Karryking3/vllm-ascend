@@ -14,7 +14,7 @@ from vllm_ascend.models.qwen4_exp.attention_dispatch import (
     prepare_qsa_union_batches,
 )
 from vllm_ascend.models.qwen4_exp.qsa import AscendQSAImpl
-from vllm_ascend.ops.triton.qwen4_exp.union_cache import prepare_union_pages
+from vllm_ascend.ops.triton.qwen4_exp.union_cache import materialize_prepared_pages, prepare_union_pages
 
 pytestmark = [
     pytest.mark.skipif(not HAS_TRITON, reason="Requires Triton"),
@@ -36,6 +36,36 @@ def test_padded_slots_cannot_overwrite_valid_rows():
     expected = torch.full((128,), -1, dtype=torch.int32)
     expected[0], expected[-1] = 4, 1
     torch.testing.assert_close(current_rows[:-1].cpu(), expected)
+
+
+def test_invalid_page_entries_and_empty_materialization_stay_safe():
+    slots = torch.tensor([-1, -1], device="npu")
+    table = torch.tensor([[-1, 99, 1], [-1, -1, -1]], dtype=torch.int32, device="npu")
+    lengths = torch.tensor([300, 0], dtype=torch.int32, device="npu")
+    positions = torch.tensor([258, -1], dtype=torch.int32, device="npu")
+    requests = torch.tensor([0, 1], dtype=torch.int32, device="npu")
+    indices = torch.tensor([[0, 33, 64, -1, -1, -1, -1], [-1] * 7], dtype=torch.int32, device="npu")
+
+    dense_pages, _, _ = prepare_union_pages(2, slots, indices, positions, lengths, requests, table, 3)
+    sparse_pages, _, _ = prepare_union_pages(2, slots, indices, positions, lengths, requests, table, 0)
+    assert dense_pages.tolist() == [1]
+    assert sparse_pages.tolist() == [1]
+
+    empty_table = torch.full((1, 2), -1, dtype=torch.int32, device="npu")
+    neg_pos = torch.tensor([-1], dtype=torch.int32, device="npu")
+    empty_pages, empty_current, _ = prepare_union_pages(
+        2, slots[:1], indices[:1], neg_pos, lengths[1:], requests[:1], empty_table, 0
+    )
+    assert empty_pages.numel() == 0
+    dummy_k = torch.empty((2, 128, 1, 192), dtype=torch.float8_e4m3fn, device="npu")
+    dummy_ks = torch.empty((2, 128, 1, 6), dtype=torch.uint8, device="npu")
+    dummy_vs = torch.empty((2, 2, 1, 384), dtype=torch.uint8, device="npu")
+    curr = torch.full((1, 1, 192), float("nan"), dtype=torch.bfloat16, device="npu")
+    out_k, out_v = materialize_prepared_pages(
+        (dummy_k, dummy_k, dummy_ks, dummy_vs), (curr, curr), empty_pages, empty_current
+    )
+    assert out_k.shape == out_v.shape == (1, 128, 1, 192)
+    assert torch.all(out_k == 0) and torch.all(out_v == 0)
 
 
 def _layer_cache(num_pages, dim, slots, generator):
@@ -65,7 +95,7 @@ def _layer_cache(num_pages, dim, slots, generator):
 @pytest.mark.parametrize("head_dim", [192, 256])
 @torch.inference_mode()
 def test_two_layers_share_dense_layout_with_independent_kv(head_dim):
-    import vllm_ascend.vllm_ascend_C  # noqa: F401 - register Union operator
+    import vllm_ascend.vllm_ascend_C  # type: ignore[import-not-found, import-untyped]  # noqa: F401
 
     generator = torch.Generator().manual_seed(453)
     counts = [515, 257]

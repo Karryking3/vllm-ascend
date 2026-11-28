@@ -17,6 +17,8 @@ def _mark_pages(
     table_stride,
     column_stride,
     num_requests,
+    table_cols,
+    num_pages,
     GROUPS: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -25,25 +27,37 @@ def _mark_pages(
     req = tl.load(requests + row)
     pos = tl.load(positions + row)
     valid_req = (req >= 0) & (req < num_requests) & (pos >= 0)
-    length = tl.load(lengths + req, valid_req, other=0)
+    safe_req = tl.minimum(tl.maximum(req, 0), num_requests - 1).to(tl.int64)
+    length = tl.load(lengths + safe_req, valid_req, other=0)
     visible = tl.minimum(pos + 1, length)
     group = tl.load(indices + row * index_stride + group_col, group_col < GROUPS, other=-1)
-    valid = valid_req & (group >= 0) & (group < visible // 4)
-    page = tl.load(table + req * table_stride + (group // 32) * column_stride, valid, other=0)
-    tl.store(used + page, 1, valid)
-    if valid_req and visible % 4 != 0:
-        tail_page = tl.load(table + req * table_stride + (visible // 128) * column_stride)
-        tl.store(used + tail_page, 1)
+    page_col = group // 32
+    valid_col = valid_req & (group >= 0) & (group < visible // 4) & (page_col < table_cols)
+    safe_col = tl.minimum(tl.maximum(page_col, 0), table_cols - 1).to(tl.int64)
+    page = tl.load(table + safe_req * table_stride + safe_col * column_stride, valid_col, other=-1)
+    valid_page = valid_col & (page >= 0) & (page < num_pages)
+    safe_page = tl.minimum(tl.maximum(page, 0), num_pages - 1).to(tl.int64)
+    tl.store(used + safe_page, 1, valid_page)
+    tail_col = visible // 128
+    valid_tail = valid_req & (visible > 0) & (visible % 4 != 0) & (tail_col < table_cols)
+    safe_tail_col = tl.minimum(tl.maximum(tail_col, 0), table_cols - 1).to(tl.int64)
+    tail_page = tl.load(table + safe_req * table_stride + safe_tail_col * column_stride, valid_tail, other=-1)
+    valid_tail_page = valid_tail & (tail_page >= 0) & (tail_page < num_pages)
+    safe_tail_page = tl.minimum(tl.maximum(tail_page, 0), num_pages - 1).to(tl.int64)
+    tl.store(used + safe_tail_page, 1, valid_tail_page)
 
 
 @triton.jit
-def _mark_request_pages(table, lengths, used, row_stride, col_stride, cols, TILE: tl.constexpr):
-    req = tl.program_id(0)
+def _mark_request_pages(table, lengths, used, row_stride, col_stride, cols, num_pages, TILE: tl.constexpr):
+    req = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * TILE + tl.arange(0, TILE)
     length = tl.load(lengths + req)
-    valid = (col < cols) & (col * 128 < length)
-    page = tl.load(table + req * row_stride + col * col_stride, valid, other=0)
-    tl.store(used + page, 1, valid)
+    valid_col = (col < cols) & (col * 128 < length)
+    safe_col = tl.minimum(col, cols - 1).to(tl.int64)
+    page = tl.load(table + req * row_stride + safe_col * col_stride, valid_col, other=-1)
+    valid_page = valid_col & (page >= 0) & (page < num_pages)
+    safe_page = tl.minimum(tl.maximum(page, 0), num_pages - 1).to(tl.int64)
+    tl.store(used + safe_page, 1, valid_page)
 
 
 @triton.jit
@@ -113,20 +127,24 @@ def _materialize(
 
 
 def prepare_union_pages(num_pages, slots, indices, positions, lengths, requests, table, request_page_limit):
+    if num_pages <= 0:
+        raise ValueError("Union page pool must be nonempty")
     groups = indices.shape[1] - 3
     used = torch.zeros(num_pages, dtype=torch.int32, device=table.device)
     if request_page_limit:
         cols = min(request_page_limit, table.shape[1])
-        _mark_request_pages[(table.shape[0], triton.cdiv(cols, 64))](
-            table,
-            lengths.contiguous(),
-            used,
-            table.stride(0),
-            table.stride(1),
-            cols,
-            TILE=64,
-        )
-    else:
+        if table.shape[0] > 0 and cols > 0:
+            _mark_request_pages[(table.shape[0], triton.cdiv(cols, 64))](
+                table,
+                lengths.contiguous(),
+                used,
+                table.stride(0),
+                table.stride(1),
+                cols,
+                num_pages,
+                TILE=64,
+            )
+    elif indices.shape[0] > 0 and table.shape[0] > 0 and table.shape[1] > 0 and groups > 0:
         _mark_pages[(indices.shape[0],)](
             indices,
             positions.contiguous(),
@@ -138,6 +156,8 @@ def prepare_union_pages(num_pages, slots, indices, positions, lengths, requests,
             table.stride(0),
             table.stride(1),
             table.shape[0],
+            table.shape[1],
+            num_pages,
             GROUPS=groups,
             TILE=triton.next_power_of_2(groups),
         )
@@ -159,9 +179,9 @@ def materialize_prepared_pages(cache, current_kv, pages, current):
     current_k, current_v = current_kv
     n = pages.numel()
     shape = (max(n, 1), 128, 1, k.shape[-1])
-    out_k = current_k.new_empty(shape)
-    out_v = current_v.new_empty(shape)
     if n:
+        out_k = current_k.new_empty(shape)
+        out_v = current_v.new_empty(shape)
         _materialize[(n * 16,)](
             pages,
             current,
@@ -181,4 +201,7 @@ def materialize_prepared_pages(cache, current_kv, pages, current):
             WIDTH=triton.next_power_of_2(k.shape[-1]),
             ROWS=8,
         )
+    else:
+        out_k = current_k.new_zeros(shape)
+        out_v = current_v.new_zeros(shape)
     return out_k, out_v

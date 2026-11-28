@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
 from tests.ut.models.test_qwen4_exp_cache_config import _allocate_mrv2_kv_cache, _groups
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
 from vllm_ascend.models.qwen4_exp import gbsa, qsa
 from vllm_ascend.models.qwen4_exp.cache_config import QSAMXFP8Spec, get_qwen4_exp_kv_cache_config
+from vllm_ascend.worker.v2 import attn_utils as attn_utils_v2
 
 
 @pytest.mark.parametrize("head_dim", [192, 256])
@@ -57,7 +60,9 @@ def test_mxfp8_scale_regions_and_views(monkeypatch, head_dim):
         shape = MooncakeBaseConnectorWorker._get_transfer_block_shape(groups[0].kv_cache_spec, src)
         page_bytes = src[0].numel() * src.element_size()
         assert shape[0] == 1 and page_bytes == src.stride(0) * src.element_size()
-        local, remote, lengths = [], [], []
+        local: list[int] = []
+        remote: list[int] = []
+        lengths: list[int] = []
         MooncakePullRecvingThread._append_block_transfer_addresses(
             MooncakePullRecvingThread._prepare_block_transfer_ranges([4, 5], [0, 1], coalesce=True),
             dst.data_ptr(),
@@ -97,7 +102,7 @@ def test_prefill_union_uses_only_connector_cache_pages(monkeypatch):
         groups,
         10**9,
     )
-    modules = {}
+    modules: dict[str, Any] = {}
     _, caches, layout = _allocate_mrv2_kv_cache(config, monkeypatch, forward_context=modules)
     for name in groups[0].layer_names:
         assert len(caches[name]) == 4
@@ -156,7 +161,7 @@ def test_gbsa_reassigned_page_restores_channel_scales(dim):
         kv_cache_config=SimpleNamespace(num_blocks=3),
         compilation_config=SimpleNamespace(static_forward_context={"gbsa": owner}),
     )
-    NPUModelRunner._fill_c8_mxfp_v_scale_caches(runner)
+    NPUModelRunner._fill_c8_mxfp_v_scale_caches(cast(Any, runner))
     expected = cache.clone()
     cache.zero_()
     expected[:2].zero_()
@@ -166,7 +171,16 @@ def test_gbsa_reassigned_page_restores_channel_scales(dim):
 
 
 def test_mxfp8_operator_attributes(monkeypatch):
-    calls = []
+    calls: list[dict[str, Any]] = []
+
+    def record_metadata(*a: Any, **kw: Any) -> torch.Tensor:
+        calls.append(kw)
+        return torch.empty(0)
+
+    def record_attention(*a: Any, **kw: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(kw)
+        return torch.zeros(1, 12, 256, dtype=torch.bfloat16), torch.empty(0)
+
     monkeypatch.setattr(
         gbsa,
         "prepare_qsa_gbsa_inputs",
@@ -178,14 +192,8 @@ def test_mxfp8_operator_attributes(monkeypatch):
             args[4],
         ),
     )
-    monkeypatch.setattr(
-        gbsa, "generic_block_sparse_attention_metadata", lambda *a, **kw: calls.append(kw) or torch.empty(0)
-    )
-    monkeypatch.setattr(
-        gbsa,
-        "generic_block_sparse_attention",
-        lambda *a, **kw: (calls.append(kw) or torch.zeros(1, 12, 256, dtype=torch.bfloat16), torch.empty(0)),
-    )
+    monkeypatch.setattr(gbsa, "generic_block_sparse_attention_metadata", record_metadata)
+    monkeypatch.setattr(gbsa, "generic_block_sparse_attention", record_attention)
     q = torch.empty(1, 12, 256, dtype=torch.float8_e4m3fn)
     k = torch.empty(2, 128, 1, 256, dtype=torch.float8_e4m3fn)
     qs = torch.empty(1, 12, 4, 2, dtype=torch.float8_e8m0fnu)
@@ -273,3 +281,84 @@ def test_dense_union_page_budget(requests, tokens, history, fits):
     from vllm_ascend.models.qwen4_exp.union_layout import fits_dense_page_budget
 
     assert fits_dense_page_budget(requests, tokens, history) is fits
+
+
+def test_mixed_mxfp8_skip_layer_descriptors_zeroer_and_reuse_guard(monkeypatch):
+    from unittest.mock import patch
+
+    import vllm_ascend.worker.v2.model_runner as model_runner_mod
+    import vllm_ascend.worker.v2.utils as v2_utils_mod
+    from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+    from vllm_ascend.worker.v2.utils import AscendV2KVBlockZeroer, C8KVBlockZeroer
+
+    groups = _groups()
+    bf16_spec = groups[0].kv_cache_spec
+    mx_args = {f.name: getattr(bf16_spec, f.name) for f in fields(bf16_spec)}
+    mx_args.update(
+        dtype=torch.float8_e4m3fn,
+        head_size=256,
+        head_size_v=256,
+        num_head_slots=2,
+        state_content_bytes=264,
+    )
+    mx_spec = QSAMXFP8Spec(**mx_args)
+    main_layers = groups[0].layer_names
+    mixed_groups = [
+        KVCacheGroupSpec([main_layers[0], main_layers[2]], mx_spec),
+        KVCacheGroupSpec([main_layers[1]], bf16_spec),
+        *groups[1:],
+    ]
+    config = get_qwen4_exp_kv_cache_config(
+        SimpleNamespace(cache_config=SimpleNamespace(num_gpu_blocks_override=3, prefix_cache_retention_interval=None)),
+        mixed_groups,
+        10**9,
+    )
+    assert config is not None
+    _, caches, layout = _allocate_mrv2_kv_cache(config, monkeypatch)
+    mx_tensors = [t for t in config.kv_cache_tensors if set(t.layers) <= {main_layers[0], main_layers[2]}]
+    assert [t.layers for t in mx_tensors] == [[main_layers[0]], [main_layers[2]]]
+    key_offset = layout.region("qsa_key").offset
+    assert mx_tensors[0].offset == key_offset
+    assert mx_tensors[1].offset == key_offset + 2 * layout.slot_backing_size
+
+    monkeypatch.setattr(attn_utils_v2, "get_layerwise_reuse_layout", lambda *_: object())
+    with pytest.raises(ValueError, match="layerwise cache reuse"):
+        _allocate_mrv2_kv_cache(config, monkeypatch)
+    monkeypatch.setattr(attn_utils_v2, "get_layerwise_reuse_layout", lambda *_: None)
+
+    @dataclass
+    class _GroupStub:
+        layer_names: list[str]
+        kv_cache_spec: Any
+        kv_cache_group_id: int = 0
+
+    recorded_contexts: list[dict[str, Any]] = []
+    with patch.object(
+        v2_utils_mod,
+        "KVBlockZeroer",
+        side_effect=lambda *_, **kw: recorded_contexts.append(kw["static_forward_context"]),
+    ):
+        group_stub = _GroupStub(layer_names=[main_layers[0]], kv_cache_spec=mx_spec)
+        layer_stub = SimpleNamespace(kv_cache=caches[main_layers[0]], kv_cache_dtype="mxfp8")
+        AscendV2KVBlockZeroer(
+            torch.device("cpu"),
+            attn_groups_iter=cast(Any, [group_stub]),
+            kernel_block_sizes=[128],
+            static_forward_context={main_layers[0]: layer_stub},
+            num_blocks=3,
+            cache_dtype="auto",
+        )
+    assert len(recorded_contexts) == 3
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
+    runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner.attn_groups = []
+    runner.kernel_block_sizes = [128]
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.kv_cache_config = SimpleNamespace(num_blocks=3)
+    runner._c8_mxfp_v_scale_caches = [(torch.ones(256, dtype=torch.uint8), caches[main_layers[0]][3], 2)]
+    with patch.object(model_runner_mod, "AscendV2KVBlockZeroer"):
+        runner._init_kv_zero_meta()
+    assert isinstance(runner.kv_block_zeroer, C8KVBlockZeroer)

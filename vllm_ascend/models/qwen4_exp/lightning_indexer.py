@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import math
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
@@ -33,6 +33,8 @@ def indexer_cache_views(packet: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     pages, states, heads, width = packet.shape
     if heads != 1 or width != _HEAD_DIM + 4 or packet.dtype != torch.uint8:
         raise ValueError("Invalid FP8 indexer cache packet")
+    if packet.storage_offset() % 4 or (pages > 1 and packet.stride(0) % 4):
+        raise ValueError("FP8 indexer cache packet must be 4-byte aligned")
     page = packet.view(pages, states * width)
     keys, scales = page.split((states * _HEAD_DIM, states * 4), dim=-1)
     return keys.view(torch.float8_e4m3fn).view(pages, states, 1, _HEAD_DIM), scales.view(torch.float32).view(
@@ -115,8 +117,8 @@ def qsa_select_paged_tokens_lightning_v2(
     )
     block_topk = token_topk // compress_ratio
     quantized = compressed_key_cache.dtype == torch.uint8
-    quant_args = ()
-    quant_kwargs = {}
+    quant_args: tuple[torch.Tensor, ...] = ()
+    quant_kwargs: dict[str, Any] = {}
     ops = torch.ops.cann_ops_transformer
     if quantized:
         compressed_key_cache, key_scale = indexer_cache_views(compressed_key_cache)

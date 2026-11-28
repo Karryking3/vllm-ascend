@@ -56,8 +56,10 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
-                kv_cache = static_forward_context[layer_name].kv_cache
-                if cache_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
+                layer_obj = static_forward_context[layer_name]
+                kv_cache = layer_obj.kv_cache
+                layer_dtype = getattr(layer_obj, "kv_cache_dtype", None) or cache_dtype
+                if layer_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
                     kv_cache = kv_cache[:3]
                 layer_caches[layer_name] = kv_cache
         component_count = 1

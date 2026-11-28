@@ -451,11 +451,13 @@ class NPUModelRunner(GPUModelRunner):
             cache_dtype=self.cache_config.cache_dtype,
             excluded_cache_components=excluded_cache_components,
         )
-        if is_c8_mxfp_kv_quant(self.vllm_config):
+        c8_v_scale_caches = getattr(self, "_c8_mxfp_v_scale_caches", None)
+        if is_c8_mxfp_kv_quant(self.vllm_config) or c8_v_scale_caches:
             # The zeroer skips the static V scales (4th tuple component); the
             # wrapper restores them on pages reassigned from Mamba.
+            entries = self._c8_mxfp_v_scale_caches if c8_v_scale_caches is None else c8_v_scale_caches
             self.kv_block_zeroer = C8KVBlockZeroer(  # type: ignore[assignment]
-                self.kv_block_zeroer, self._c8_mxfp_v_scale_caches, fill_mxfp_v_scale_cache
+                self.kv_block_zeroer, entries, fill_mxfp_v_scale_cache
             )
 
     def _initialize_kv_cache_upstream(

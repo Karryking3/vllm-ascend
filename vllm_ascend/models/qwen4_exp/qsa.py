@@ -22,7 +22,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, cast
 
 import torch
-import torch_npu
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
@@ -91,6 +90,11 @@ else:
     QSAIndexerBackend = qsa_indexer.QSAIndexerBackend
     QSAIndexerMetadataBuilder = qsa_indexer.QSAIndexerMetadataBuilder
     QSARawKeyCache = qsa_indexer.QSARawKeyCache
+
+try:
+    import torch_npu
+except ImportError:  # pragma: no cover - CPU-only import environments
+    torch_npu = None
 
 # The upstream backend class is renamed per tree; the class definition below
 # carries the resulting valid-type/misc ignores.
@@ -996,7 +1000,7 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
             if recipe.get(recipe_key, recipe.get(f"model.{recipe_key}")) == "QK_FP8_DYNAMIC":
                 compressed = self.indexer.compressed_key_cache
                 compressed.dtype = torch.uint8
-                compressed.head_size = self.indexer.index_head_dim + torch.float32.itemsize
+                compressed.head_size = self.indexer.index_head_dim + get_dtype_size(torch.float32)
             if self.num_kv_heads != 1:
                 raise ValueError("QSA cache store currently requires one KV head per TP rank")
             self._qsa_model_dtype = vllm_config.model_config.dtype

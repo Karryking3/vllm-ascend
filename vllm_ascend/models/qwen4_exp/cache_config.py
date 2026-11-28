@@ -746,10 +746,11 @@ def get_qwen4_exp_kv_cache_config(
                 owners_by_group.setdefault(owner.group_id, []).append(owner)
         for group_owners in owners_by_group.values():
             owners = sorted(group_owners, key=lambda owner: owner.slot)
-            for region_name, members in groupby(
-                owners, key=lambda owner: layout.region_name_for_owner(owner.layer_name)
+            for (region_name, _), members in groupby(
+                enumerate(owners),
+                key=lambda item: (layout.region_name_for_owner(item[1].layer_name), item[1].slot - item[0]),
             ):
-                component_owners = list(members)
+                component_owners = [owner for _, owner in members]
                 region = layout.region(region_name)
                 tensors.append(
                     KVCacheTensor(

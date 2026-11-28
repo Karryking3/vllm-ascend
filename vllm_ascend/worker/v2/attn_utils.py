@@ -1023,6 +1023,8 @@ def _allocate_kv_cache(
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     reuse_layout = get_layerwise_reuse_layout(kv_cache_config)
     if reuse_layout is not None:
+        if any(isinstance(spec, QSAMXFP8Spec) for spec in layer_kv_cache_spec.values()):
+            raise ValueError("Qwen4 QSA MXFP8 split K/V/scale pools do not support layerwise cache reuse.")
         return allocate_cache_backing(
             kv_cache_config,
             layer_kv_cache_spec,
@@ -1675,6 +1677,8 @@ def _reshape_kv_cache_v2(
                     raise ValueError(f"Qwen4 hybrid cache for {layer_name} must use one raw tensor.")
                 slot_offset = owner.slot * qwen4_cache_layout.slot_backing_size
                 if get_layerwise_reuse_layout(kv_cache_config) is not None and owner.role not in (PLE, HIDDEN):
+                    if isinstance(kv_cache_spec, QSAMXFP8Spec):
+                        raise ValueError("Qwen4 QSA MXFP8 split K/V/scale pools do not support layerwise cache reuse.")
                     # Reuse allocation already returns this owner's byte window.
                     # Keep component offsets relative to that window.
                     region_name = qwen4_cache_layout.region_name_for_owner(layer_name)

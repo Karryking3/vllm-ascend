@@ -42,7 +42,7 @@ def qsa_gbsa_attention(
     logical_max_seqlen_kv = block_table.shape[1] * GBSA_PAGE_SIZE
     num_kv_heads = key_cache.shape[2]
     is_mxfp8 = q_scale is not None
-    if is_mxfp8:
+    if q_scale is not None:
         if query.dtype != torch.float8_e4m3fn or query.shape[-1] not in (192, 256):
             raise ValueError("QSA MXFP8 GBSA requires FP8 E4M3 Q/K/V and D192 or D256")
         if k_scale is None or v_scale is None:

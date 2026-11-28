@@ -24,10 +24,19 @@ def selector(monkeypatch):
                 torch.empty(0),
             )
         ),
+        quant_lightning_indexer_v2_metadata=Mock(return_value=torch.empty(1024, dtype=torch.int32)),
+        quant_lightning_indexer_v2=Mock(
+            side_effect=lambda q, k, w, qs, ks, topk, **kwargs: (
+                torch.zeros(q.shape[0], 1, topk, dtype=torch.int32),
+                torch.empty(0),
+            )
+        ),
     )
     for name, op in (
         ("lightning_indexer_metadata", bindings.lightning_indexer_v2_metadata),
         ("lightning_indexer", bindings.lightning_indexer_v2),
+        ("quant_lightning_indexer_metadata", bindings.quant_lightning_indexer_v2_metadata),
+        ("quant_lightning_indexer", bindings.quant_lightning_indexer_v2),
     ):
         monkeypatch.setattr(torch.ops.cann_ops_transformer, name, op, raising=False)
 
@@ -166,3 +175,39 @@ def test_further_trimmed_query_regenerates_prepared_schedule(selector):
         bindings.lightning_indexer_v2_metadata.call_args.kwargs["cu_seqlens_q"],
         torch.tensor([0, 2, 4, 4], dtype=torch.int32),
     )
+
+
+@pytest.mark.parametrize("page_stride", [32 * 132, 32 * 256])
+def test_quantized_indexer_cache_views_and_selector_contract(selector, page_stride):
+    module, bindings, packing, _ = selector
+    backing = torch.zeros(4 * page_stride + 4, dtype=torch.uint8)
+    packet = torch.as_strided(backing, (3, 32, 1, 132), (page_stride, 132, 32 * 132, 1), storage_offset=4)
+    rows = torch.linspace(-2.0, 2.0, 3 * 32 * 128, dtype=torch.bfloat16).reshape(3, 32, 1, 128)
+    quant_keys, quant_scales = module.quantize_indexer_rows(rows)
+    keys_view, scales_view = module.indexer_cache_views(packet)
+    keys_view.copy_(quant_keys)
+    scales_view.copy_(quant_scales.squeeze(-1))
+    torch.testing.assert_close(keys_view.float(), quant_keys.float())
+    torch.testing.assert_close(scales_view, quant_scales.squeeze(-1))
+
+    unaligned = torch.as_strided(backing, (2, 32, 1, 132), (page_stride, 132, 32 * 132, 1), storage_offset=1)
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        module.indexer_cache_views(unaligned)
+    bad_stride = torch.as_strided(backing, (2, 32, 1, 132), (32 * 132 + 2, 132, 32 * 132, 1), storage_offset=0)
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        module.indexer_cache_views(bad_stride)
+
+    inputs = _inputs()
+    inputs["compressed_key_cache"] = packet
+    result = module.qsa_select_paged_tokens_lightning_v2(**inputs)
+    assert result is inputs["out"]
+    bindings.quant_lightning_indexer_v2_metadata.assert_called_once()
+    assert bindings.quant_lightning_indexer_v2_metadata.call_args.kwargs["quant_mode"] == 1
+    bindings.quant_lightning_indexer_v2.assert_called_once()
+    args, kwargs = bindings.quant_lightning_indexer_v2.call_args
+    assert args[0].dtype == torch.float8_e4m3fn and args[0].shape == (6, 4, 128)
+    assert args[1].dtype == torch.float8_e4m3fn and args[1].shape == (3, 32, 1, 128)
+    assert args[3].dtype == torch.float32 and args[3].shape == (6, 4)
+    assert args[4].dtype == torch.float32 and args[4].shape == (3, 32, 1)
+    assert args[5] == 512 and kwargs["quant_mode"] == 1
+    packing.pack_qsa_group_indices_npu.assert_called_once()
