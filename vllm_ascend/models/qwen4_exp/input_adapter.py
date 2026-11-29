@@ -393,7 +393,11 @@ class Qwen4ExpPreparedInputAdapter:
             setattr(main, field, prepared)
             return
         if graph_cu_q is not None and graph_offsets is not None:
-            graph_cu_q.copy_(graph_offsets)
+            if main.max_query_len == 1 and rows == requests:
+                # Include padded query rows while preserving the captured buffer address.
+                torch.arange(requests + 1, out=graph_cu_q)
+            else:
+                graph_cu_q.copy_(graph_offsets)
         # Match both Python indexing and the Triton preparation kernel: a
         # negative request index addresses from the end, so graph-padding -1
         # rows use the final request rather than request zero.

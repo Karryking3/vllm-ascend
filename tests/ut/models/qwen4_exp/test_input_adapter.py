@@ -509,3 +509,18 @@ def test_graph_query_offsets_slice_oversized_buffer_and_register_mtp(monkeypatch
     assert main.qsa_request_cu_q.data_ptr() == cu_q_ptr
     assert main.qsa_gbsa_metadata.data_ptr() == gbsa_ptr
     torch.testing.assert_close(main.qsa_request_cu_q, torch.tensor([0, 3, 4], dtype=torch.int64))
+
+    # Draft replay has one physical query per request, even when the last KV length is zero.
+    raw.token_to_req = torch.tensor([0, -1], dtype=torch.int32)
+    raw.logical_positions = torch.tensor([7, -1], dtype=torch.int32)
+    seq_lens[1] = 0
+    oversized_offsets[:3] = torch.tensor([0, 1, 1], dtype=torch.int32)
+    for item in (main, mtp_main):
+        item.num_actual_tokens = 2
+        item.max_query_len = 1
+    compressed.num_actual_tokens = 2
+    compressed.token_to_req = raw.token_to_req
+    adapter.prepare_attention_metadata(metadata, full_graph=True)
+    assert main.qsa_request_cu_q.data_ptr() == cu_q_ptr
+    torch.testing.assert_close(main.qsa_request_cu_q, torch.tensor([0, 1, 2], dtype=torch.int64))
+    torch.testing.assert_close(seq_lens, torch.tensor([8, 0], dtype=torch.int32))
