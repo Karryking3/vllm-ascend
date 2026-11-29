@@ -74,6 +74,15 @@ def qsa_gbsa_attention(
     else:
         effective_max_query_len = max_query_len
 
+    if (
+        prepared_metadata is None
+        and query_start_loc is not None
+        and max_query_len == 1
+        and query.shape[0] == block_table.shape[0]
+    ):
+        # Single-token draft graphs replay one query per row, including padded requests.
+        query_start_loc = torch.arange(query.shape[0] + 1, dtype=torch.int64, device=query.device)
+
     sparse_idx, sparse_count, kv_lengths, cu_q, page_table = prepare_qsa_gbsa_inputs(
         compact_indices, logical_positions, seq_lens, token_to_req, block_table, num_kv_heads, query_start_loc
     )

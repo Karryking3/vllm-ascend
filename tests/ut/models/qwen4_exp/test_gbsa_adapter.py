@@ -404,3 +404,31 @@ def test_qsa_gbsa_validates_packed_query_boundaries_and_max_len():
         fn(*args, query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int64))
     with pytest.raises(ValueError, match="positive"):
         fn(*args, query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int64), max_query_len=0)
+
+    # Seven live requests replay an eight-row single-token draft graph.
+    offsets = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 7], dtype=torch.int64)
+    lengths = torch.tensor([1] * 7 + [0], dtype=torch.int32)
+    seen = []
+
+    def check_geometry(*args, **kwargs):
+        torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.arange(9))
+        torch.testing.assert_close(kwargs["seqused_kv"], lengths)
+        seen.append(True)
+        return torch.empty(0)
+
+    namespace["generic_block_sparse_attention_metadata"] = check_geometry
+    query = torch.zeros(8, 4, 128, dtype=torch.bfloat16)
+    fn(
+        query,
+        keys,
+        keys,
+        indices[:1].expand(8, -1).contiguous(),
+        torch.zeros(8, 1, dtype=torch.int32),
+        torch.arange(8, dtype=torch.int32),
+        lengths - 1,
+        lengths,
+        torch.empty_like(query),
+        query_start_loc=offsets,
+        max_query_len=1,
+    )
+    assert seen == [True]
